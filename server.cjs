@@ -23,10 +23,12 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
 ));
 
 // src/index.ts
-var import_express7 = __toESM(require("express"));
+var import_express8 = __toESM(require("express"));
 var import_cors = __toESM(require("cors"));
 var import_helmet = __toESM(require("helmet"));
-var import_http9 = __toESM(require("http"));
+var import_http10 = __toESM(require("http"));
+var import_fs = __toESM(require("fs"));
+var import_path2 = __toESM(require("path"));
 var import_express_rate_limit3 = __toESM(require("express-rate-limit"));
 
 // src/config.ts
@@ -42,7 +44,10 @@ var schema = import_zod.z.object({
   JWT_SECRET: import_zod.z.string().min(16, "JWT_SECRET \u0434\u043E\u043B\u0436\u0435\u043D \u0431\u044B\u0442\u044C \u043D\u0435 \u043A\u043E\u0440\u043E\u0447\u0435 16 \u0441\u0438\u043C\u0432\u043E\u043B\u043E\u0432"),
   JWT_EXPIRES_IN: import_zod.z.string().default("7d"),
   CORS_ORIGIN: import_zod.z.string().default("*"),
-  PUBLIC_APP_URL: import_zod.z.string().default("http://localhost:5173")
+  PUBLIC_APP_URL: import_zod.z.string().default("http://localhost:5173"),
+  LIVEKIT_URL: import_zod.z.string().optional(),
+  LIVEKIT_API_KEY: import_zod.z.string().optional(),
+  LIVEKIT_API_SECRET: import_zod.z.string().optional()
 });
 var parsed = schema.safeParse(process.env);
 if (!parsed.success) {
@@ -154,13 +159,88 @@ async function resolveTarget(userId, kind, id) {
 var canSend = (t) => t.kind === "dm" || has(t.perms, P.SEND_MESSAGES);
 var canModerate = (t) => t.kind === "channel" && has(t.perms, P.MANAGE_MESSAGES);
 
+// src/voice.ts
+var VoiceRegistry = class {
+  constructor() {
+    this.byUser = /* @__PURE__ */ new Map();
+  }
+  /** Регистрирует пользователя в канале (один активный голосовой сеанс на пользователя). Возвращает прежний сеанс, если был. */
+  join(e) {
+    const prev = this.byUser.get(e.userId) ?? null;
+    this.byUser.set(e.userId, { muted: false, deafened: false, video: false, screen: false, ...e, since: Date.now() });
+    return prev;
+  }
+  /** Выход; если передан socketId — только если сеанс принадлежит этому сокету. */
+  leave(userId, socketId) {
+    const e = this.byUser.get(userId);
+    if (!e || socketId !== void 0 && e.socketId !== socketId) return null;
+    this.byUser.delete(userId);
+    return e;
+  }
+  update(userId, socketId, patch) {
+    const e = this.byUser.get(userId);
+    if (!e || e.socketId !== socketId) return null;
+    for (const k of ["muted", "deafened", "video", "screen"]) if (typeof patch[k] === "boolean") e[k] = patch[k];
+    return e;
+  }
+  get(userId) {
+    return this.byUser.get(userId) ?? null;
+  }
+  dropChannel(channelId) {
+    return this.dropWhere((e) => e.channelId === channelId);
+  }
+  dropServer(serverId) {
+    return this.dropWhere((e) => e.serverId === serverId);
+  }
+  dropUserFromServer(userId, serverId) {
+    const e = this.byUser.get(userId);
+    if (e && e.serverId === serverId) {
+      this.byUser.delete(userId);
+      return e;
+    }
+    return null;
+  }
+  dropWhere(fn) {
+    const out = [];
+    for (const e of this.byUser.values()) if (fn(e)) out.push(e);
+    for (const e of out) this.byUser.delete(e.userId);
+    return out;
+  }
+  /** channelId -> участники, для одного сервера. */
+  snapshot(serverId) {
+    const out = {};
+    for (const e of [...this.byUser.values()].filter((x) => x.serverId === serverId).sort((a, b) => a.since - b.since)) {
+      const { socketId, serverId: _s, channelId, ...view2 } = e;
+      (out[channelId] ??= []).push(view2);
+    }
+    return out;
+  }
+};
+var voice = new VoiceRegistry();
+
 // src/socket.ts
 var io = null;
 var online = /* @__PURE__ */ new Map();
 var emitToUser = (userId, event, data) => io?.to(`user:${userId}`).emit(event, data);
 var emitToServer = (serverId, event, data) => io?.to(`server:${serverId}`).emit(event, data);
 var joinServerRoom = (userId, serverId) => io?.in(`user:${userId}`).socketsJoin(`server:${serverId}`);
-var leaveServerRoom = (userId, serverId) => io?.in(`user:${userId}`).socketsLeave(`server:${serverId}`);
+var leaveServerRoom = (userId, serverId) => {
+  io?.in(`user:${userId}`).socketsLeave(`server:${serverId}`);
+  const e = voice.dropUserFromServer(userId, serverId);
+  if (e) {
+    io?.to(e.socketId).emit("voice:replaced", {});
+    broadcastVoice(serverId);
+  }
+};
+var broadcastVoice = (serverId) => emitToServer(serverId, "voice:update", { serverId, channels: voice.snapshot(serverId) });
+function voiceDropChannel(channelId, serverId) {
+  const dropped = voice.dropChannel(channelId);
+  for (const e of dropped) io?.to(e.socketId).emit("voice:replaced", {});
+  if (dropped.length) broadcastVoice(serverId);
+}
+function voiceDropServer(serverId) {
+  for (const e of voice.dropServer(serverId)) io?.to(e.socketId).emit("voice:replaced", {});
+}
 async function broadcastPresence(userId) {
   const u = await prisma.user.findUnique({ where: { id: userId }, select: { status: true } });
   if (!u) return;
@@ -201,11 +281,38 @@ function initSocket(server2) {
       } catch {
       }
     });
+    socket.on("voice:join", async (p, ack) => {
+      try {
+        const channelId = String(p?.channelId ?? "");
+        const ch = await prisma.channel.findUnique({ where: { id: channelId } });
+        if (!ch || ch.type !== "VOICE") throw new Error("\u0413\u043E\u043B\u043E\u0441\u043E\u0432\u043E\u0439 \u043A\u0430\u043D\u0430\u043B \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D");
+        if (!has(await getPerms(userId, ch.serverId), P.CONNECT_VOICE)) throw new Error("\u041D\u0435\u0442 \u043F\u0440\u0430\u0432\u0430 \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0430\u0442\u044C\u0441\u044F \u043A \u0433\u043E\u043B\u043E\u0441\u0443");
+        const u = await prisma.user.findUnique({ where: { id: userId } });
+        if (!u) throw new Error("\u041F\u043E\u043B\u044C\u0437\u043E\u0432\u0430\u0442\u0435\u043B\u044C \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D");
+        const prev = voice.join({ channelId, serverId: ch.serverId, userId, socketId: socket.id, username: u.username, displayName: u.displayName, avatarUrl: u.avatarUrl });
+        if (prev && prev.socketId !== socket.id) io?.to(prev.socketId).emit("voice:replaced", {});
+        if (prev && prev.serverId !== ch.serverId) broadcastVoice(prev.serverId);
+        broadcastVoice(ch.serverId);
+        ack?.({ ok: true });
+      } catch (e) {
+        ack?.({ ok: false, error: e.message ?? "\u041E\u0448\u0438\u0431\u043A\u0430" });
+      }
+    });
+    const voiceLeave = () => {
+      const e = voice.leave(userId, socket.id);
+      if (e) broadcastVoice(e.serverId);
+    };
+    socket.on("voice:leave", voiceLeave);
+    socket.on("voice:state", (p) => {
+      const e = voice.update(userId, socket.id, { muted: p?.muted, deafened: p?.deafened, video: p?.video, screen: p?.screen });
+      if (e) broadcastVoice(e.serverId);
+    });
     socket.on("presence:refresh", () => {
       broadcastPresence(userId).catch(() => {
       });
     });
     socket.on("disconnect", () => {
+      voiceLeave();
       const n = (online.get(userId) ?? 1) - 1;
       if (n <= 0) online.delete(userId);
       else online.set(userId, n);
@@ -486,6 +593,7 @@ serversRouter.delete("/:id", ah(async (req, res) => {
   if (!s) throw new HttpError(404, "\u0421\u0435\u0440\u0432\u0435\u0440 \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D");
   if (s.ownerId !== req.userId) throw new HttpError(403, "\u0423\u0434\u0430\u043B\u0438\u0442\u044C \u0441\u0435\u0440\u0432\u0435\u0440 \u043C\u043E\u0436\u0435\u0442 \u0442\u043E\u043B\u044C\u043A\u043E \u0432\u043B\u0430\u0434\u0435\u043B\u0435\u0446");
   emitToServer(s.id, "server:deleted", { serverId: s.id });
+  voiceDropServer(s.id);
   await prisma.server.delete({ where: { id: s.id } });
   res.json({ ok: true });
 }));
@@ -520,6 +628,7 @@ serversRouter.delete("/:id/channels/:channelId", ah(async (req, res) => {
   await requirePerm(req.userId, req.params.id, P.MANAGE_CHANNELS);
   const r = await prisma.channel.deleteMany({ where: { id: req.params.channelId, serverId: req.params.id } });
   if (!r.count) throw new HttpError(404, "\u041A\u0430\u043D\u0430\u043B \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D");
+  voiceDropChannel(req.params.channelId, req.params.id);
   emitToServer(req.params.id, "channels:update", { serverId: req.params.id });
   res.json({ ok: true });
 }));
@@ -941,17 +1050,85 @@ dmsRouter.post("/:id/leave", ah(async (req, res) => {
   res.json({ ok: true });
 }));
 
+// src/routes/voice.ts
+var import_express7 = require("express");
+
+// src/livekit.ts
+var import_crypto3 = __toESM(require("crypto"));
+var b64u = (v) => Buffer.from(v).toString("base64url");
+function createVoiceToken(o) {
+  const now = o.now ?? Math.floor(Date.now() / 1e3);
+  const header = { alg: "HS256", typ: "JWT" };
+  const payload = {
+    iss: o.apiKey,
+    sub: o.identity,
+    jti: o.identity,
+    name: o.name,
+    metadata: o.metadata ?? "",
+    nbf: now - 10,
+    iat: now,
+    exp: now + (o.ttlSeconds ?? 6 * 3600),
+    video: { room: o.room, roomJoin: true, canPublish: o.canPublish, canSubscribe: true, canPublishData: true }
+  };
+  const data = `${b64u(JSON.stringify(header))}.${b64u(JSON.stringify(payload))}`;
+  return `${data}.${import_crypto3.default.createHmac("sha256", o.apiSecret).update(data).digest("base64url")}`;
+}
+
+// src/routes/voice.ts
+var voiceRouter = (0, import_express7.Router)();
+voiceRouter.use(requireAuth);
+voiceRouter.get("/active", ah(async (req, res) => {
+  const members = await prisma.member.findMany({
+    where: { userId: req.userId },
+    include: { server: { include: { channels: { where: { type: "VOICE" } } } } }
+  });
+  const out = [];
+  for (const m of members) {
+    const snap = voice.snapshot(m.serverId);
+    for (const c of m.server.channels) {
+      if (snap[c.id]?.length) out.push({ serverId: m.serverId, serverName: m.server.name, channelId: c.id, channelName: c.name, users: snap[c.id] });
+    }
+  }
+  res.json(out);
+}));
+voiceRouter.get("/state/:serverId", ah(async (req, res) => {
+  if (await getPerms(req.userId, req.params.serverId) === null) throw new HttpError(403, "\u0412\u044B \u043D\u0435 \u0443\u0447\u0430\u0441\u0442\u043D\u0438\u043A \u044D\u0442\u043E\u0433\u043E \u0441\u0435\u0440\u0432\u0435\u0440\u0430");
+  res.json(voice.snapshot(req.params.serverId));
+}));
+voiceRouter.post("/:channelId/token", ah(async (req, res) => {
+  if (!config.LIVEKIT_URL || !config.LIVEKIT_API_KEY || !config.LIVEKIT_API_SECRET)
+    throw new HttpError(503, "\u0413\u043E\u043B\u043E\u0441\u043E\u0432\u043E\u0439 \u0441\u0435\u0440\u0432\u0435\u0440 \u043D\u0435 \u043D\u0430\u0441\u0442\u0440\u043E\u0435\u043D: \u043D\u0430 \u0441\u0435\u0440\u0432\u0435\u0440\u0435 \u043D\u0435 \u0437\u0430\u0434\u0430\u043D\u044B LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET");
+  const ch = await prisma.channel.findUnique({ where: { id: req.params.channelId } });
+  if (!ch || ch.type !== "VOICE") throw new HttpError(404, "\u0413\u043E\u043B\u043E\u0441\u043E\u0432\u043E\u0439 \u043A\u0430\u043D\u0430\u043B \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D");
+  const perms = await getPerms(req.userId, ch.serverId);
+  if (perms === null) throw new HttpError(403, "\u0412\u044B \u043D\u0435 \u0443\u0447\u0430\u0441\u0442\u043D\u0438\u043A \u044D\u0442\u043E\u0433\u043E \u0441\u0435\u0440\u0432\u0435\u0440\u0430");
+  if (!has(perms, P.CONNECT_VOICE)) throw new HttpError(403, "\u041D\u0435\u0442 \u043F\u0440\u0430\u0432\u0430 \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0430\u0442\u044C\u0441\u044F \u043A \u0433\u043E\u043B\u043E\u0441\u043E\u0432\u044B\u043C \u043A\u0430\u043D\u0430\u043B\u0430\u043C");
+  const user = await prisma.user.findUnique({ where: { id: req.userId } });
+  if (!user) throw new HttpError(401, "\u041F\u043E\u043B\u044C\u0437\u043E\u0432\u0430\u0442\u0435\u043B\u044C \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D");
+  const canPublish = has(perms, P.SPEAK);
+  const token = createVoiceToken({
+    apiKey: config.LIVEKIT_API_KEY,
+    apiSecret: config.LIVEKIT_API_SECRET,
+    room: ch.id,
+    identity: user.id,
+    name: user.displayName,
+    metadata: JSON.stringify({ username: user.username, avatarUrl: user.avatarUrl }),
+    canPublish
+  });
+  res.json({ token, url: config.LIVEKIT_URL, channelId: ch.id, serverId: ch.serverId, channelName: ch.name, canPublish });
+}));
+
 // src/index.ts
-var app = (0, import_express7.default)();
+var app = (0, import_express8.default)();
 app.set("trust proxy", 1);
-app.use((0, import_helmet.default)({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
+app.use((0, import_helmet.default)({ crossOriginResourcePolicy: { policy: "cross-origin" }, contentSecurityPolicy: false }));
 app.use((0, import_cors.default)({ origin: corsOrigin }));
-app.use(import_express7.default.json({ limit: "1mb" }));
+app.use(import_express8.default.json({ limit: "1mb" }));
 app.use((0, import_express_rate_limit3.default)({ windowMs: 6e4, limit: 300, standardHeaders: true, legacyHeaders: false }));
 app.get("/health", async (_req, res) => {
   try {
     await prisma.$queryRaw`SELECT 1`;
-    res.json({ ok: true, db: "up" });
+    res.json({ ok: true, db: "up", voice: !!(config.LIVEKIT_URL && config.LIVEKIT_API_KEY && config.LIVEKIT_API_SECRET) });
   } catch {
     res.status(503).json({ ok: false, db: "down" });
   }
@@ -963,9 +1140,15 @@ app.use("/api/servers", serversRouter);
 app.use("/api/invites", invitesRouter);
 app.use("/api/messages", messagesRouter);
 app.use("/api/dms", dmsRouter);
+app.use("/api/voice", voiceRouter);
+var webIndex = import_path2.default.join(__dirname, "index.html");
+if (import_fs.default.existsSync(webIndex)) app.get("/", (_req, res) => {
+  res.set("Cache-Control", "no-cache");
+  res.sendFile(webIndex);
+});
 app.use((_req, res) => res.status(404).json({ error: "\u041D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D\u043E" }));
 app.use(errorHandler);
-var server = import_http9.default.createServer(app);
+var server = import_http10.default.createServer(app);
 initSocket(server);
 server.listen(config.PORT, () => logger.info(`Dickcord backend: http://localhost:${config.PORT}`));
 var shutdown = async () => {
